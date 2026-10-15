@@ -1,0 +1,6 @@
+interface:
+  display_name: "Convert Paper"
+  short_description: "Convert PDFs with auditable source review"
+  default_prompt: "Use $convert-paper to convert these PDFs and review flagged equations and tables against source images."
+policy:
+  allow_implicit_invocation: true
