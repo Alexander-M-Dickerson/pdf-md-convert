@@ -71,7 +71,10 @@ def review_workpack(output: Path, max_pages: int = 20) -> dict:
         for key in missing:
             tasks.append(dict(id=f"{record['id']}-missing-{key}", document_id=record['id'], kind='missing-exhibit',
                               key=key, source_sha256=record['source_sha256'], page=None, verified=False, review_note=''))
-        risks = [r for r in data.get('risks', []) if r['text_chars'] < 100 or r['score'] >= 18]
+        damaged = set(record['qa'].get('damaged_text_pages', []))
+        risks = [dict(r, reasons=[*r['reasons'], 'damaged-text-encoding']) if r['page'] in damaged else r
+                 for r in data.get('risks', []) if r['text_chars'] < 100 or r['score'] >= 18 or r['page'] in damaged]
+        risks += [dict(page=p, reasons=['damaged-text-encoding']) for p in sorted(damaged - {r['page'] for r in risks})]
         with fitz.open(record['source']) as doc:
             for i,risk in enumerate(risks):
                 image = dest/'pages'/record['id']/f"page_{risk['page']:03d}.png"

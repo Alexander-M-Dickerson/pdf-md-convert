@@ -28,10 +28,13 @@ PROSE_RE = re.compile(
 DATA_RE = re.compile(r"\bObservations\b|\bConstant\b|\bFixed\b|\bSD\b|\bMinimum\b", re.IGNORECASE)
 HEADER_RE = re.compile(r"#|\(\d+\)|\b(Panel\s+[A-Z]:|Dependent Variable|All Trades|Model|Specification)\b", re.IGNORECASE)
 NUMERIC_VALUE_PATTERN = r"[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?"
+# Statistics appear bare, in parentheses, or in brackets ([1.42] t-statistics).
 NUMERIC_RE = re.compile(
-    rf"^\(?{NUMERIC_VALUE_PATTERN}\)?(?:\*+)?(?:/{NUMERIC_VALUE_PATTERN})?(?:\*+)?$"
+    rf"^(?:\(|\[)?{NUMERIC_VALUE_PATTERN}(?:\)|\])?(?:\*+)?(?:/{NUMERIC_VALUE_PATTERN})?(?:\*+)?$"
 )
-COLUMN_TOKEN_RE = re.compile(r"^(?:#|\(\d+\)|\d+|N|R2|R\^2|Adj\.?\s*R2)$", re.IGNORECASE)
+# Column heads include long-short portfolios such as "10-1" and "H-L"; year
+# ranges such as "1970-1990" are row labels, not columns.
+COLUMN_TOKEN_RE = re.compile(r"^(?:#|\(\d+\)|\d+|\d{1,2}\s*-\s*\d{1,2}|H\s*-\s*L|N|R2|R\^2|Adj\.?\s*R2)$", re.IGNORECASE)
 ROMAN_TO_INT = {
     "I": 1,
     "II": 2,
@@ -88,8 +91,80 @@ def clamp_rect(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
     return clamped
 
 
+def sideways_text_direction(page) -> tuple[int, int] | None:
+    """(0, -1) or (0, 1) when most text on the page runs vertically, else None.
+
+    Landscape tables are often printed sideways on portrait pages without a
+    page rotation. A cheap word-shape screen avoids a line-direction pass on
+    ordinary pages.
+    """
+    words = [w for w in page.get_text("words") if len(str(w[4])) >= 3]
+    if len(words) < 20 or sum((w[3] - w[1]) > 1.5 * (w[2] - w[0]) for w in words) < .6 * len(words):
+        return None
+    counts: dict[tuple[int, int], int] = {}
+    for block in page.get_text("dict", flags=fitz.TEXTFLAGS_WORDS)["blocks"]:
+        for line in block.get("lines", []):
+            direction = tuple(round(v) for v in line["dir"])
+            counts[direction] = counts.get(direction, 0) + sum(len(span["text"]) for span in line["spans"])
+    direction = max(counts, key=counts.get) if counts else None
+    if direction in {(0, -1), (0, 1)} and counts[direction] > .6 * sum(counts.values()):
+        return direction
+    return None
+
+
+class SidewaysPage:
+    """A page presented in the reading frame of its sideways text.
+
+    Words and blocks are rotated so table rows run left to right, crops render
+    upright, and ``to_page_rect`` maps regions back to page coordinates. Native
+    ruled-table detection is not attempted in this frame.
+    """
+
+    def __init__(self, page, direction: tuple[int, int]):
+        self.page = page
+        self.direction = direction
+        width, height = page.rect.width, page.rect.height
+        # Upward text: (x, y) -> (H - y, x). Downward text: (x, y) -> (y, W - x).
+        self.matrix = (fitz.Matrix(0, 1, -1, 0, height, 0) if direction == (0, -1)
+                       else fitz.Matrix(0, -1, 1, 0, 0, width))
+        self.rect = fitz.Rect(0, 0, height, width)
+        # Words carry block/line numbers of the same text page as this dict.
+        self.line_direction = {
+            (block["number"], i): tuple(round(v) for v in line["dir"])
+            for block in page.get_text("dict", flags=fitz.TEXTFLAGS_WORDS)["blocks"]
+            for i, line in enumerate(block.get("lines", []))
+        }
+
+    def __getattr__(self, name):
+        return getattr(self.page, name)
+
+    def to_page_rect(self, rect) -> fitz.Rect:
+        return fitz.Rect(rect) * ~self.matrix
+
+    def get_text(self, option="text", **kwargs):
+        if option == "words":
+            return [(*fitz.Rect(w[:4]) * self.matrix, *w[4:]) for w in self.page.get_text("words")
+                    if self.line_direction.get((w[5], w[6])) == self.direction]
+        if option == "blocks":
+            keep = {block for (block, _), direction in self.line_direction.items() if direction == self.direction}
+            return [(*fitz.Rect(b[:4]) * self.matrix, *b[4:]) for b in self.page.get_text("blocks") if b[5] in keep]
+        return self.page.get_text(option, **kwargs)
+
+    def get_drawings(self):
+        return []
+
+    def get_pixmap(self, *, matrix=fitz.Identity, clip=None, **kwargs):
+        turn = 90 if self.direction == (0, -1) else -90
+        clip = self.to_page_rect(clip) if clip is not None else None
+        return self.page.get_pixmap(matrix=fitz.Matrix(matrix).prerotate(turn), clip=clip, **kwargs)
+
+
 def render_crop(page: fitz.Page, rect: fitz.Rect, crop_path: Path, dpi: int = 190) -> bool:
-    crop_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Typically a Windows path-length limit; QA reports the missing image.
+        return False
     candidates = [(clamp_rect(page, rect), dpi), (clamp_rect(page, fitz.Rect(36, 36, page.rect.x1 - 36, page.rect.y1 - 36)), 140)]
     for candidate, candidate_dpi in candidates:
         try:
@@ -672,6 +747,11 @@ def reconstruct_clustered_table(rows: list[list[tuple]]) -> tuple[str, str, list
             continue
 
         header_row = not seen_numeric_data and sum(bool(NUMERIC_RE.fullmatch(normalize_cell(str(w[4])))) for w in row) < 2
+        # Stacked panels repeat heads after data rows: words only over the data
+        # columns, none numeric. They are heads, not part of the next row label.
+        if (not header_row and seen_numeric_data and all(float(w[0]) >= anchors[0] - tolerance for w in row)
+                and not any(NUMERIC_RE.fullmatch(normalize_cell(str(w[4]))) for w in row)):
+            header_row = True
         cells = []
         if header_row:
             for word in row:
@@ -903,6 +983,8 @@ def detect_table_regions(
             continue
         page = doc[page_number - 1]
         captions = actual_table_caption_lines(page.get_text("text"))
+        if captions and (direction := sideways_text_direction(page)):
+            page = SidewaysPage(page, direction)
         caption_positions: list[tuple[str, str, float]] = []
         for number, title in captions:
             y = caption_y(page, number)
@@ -944,6 +1026,9 @@ def detect_table_regions(
             if not render_crop(page, rect, crop_path):
                 reasons = [*reasons, "crop-render-failed"]
                 confidence = "low"
+            if isinstance(page, SidewaysPage):
+                rect = page.to_page_rect(rect)
+                reasons = [*reasons, "sideways-text-reading-frame"]
             region = TableRegion(
                 page=page_number,
                 number=number,
@@ -1220,6 +1305,10 @@ def write_table_tsv(extracted: str, tsv_path: Path) -> str:
     tsv = markdown_table_to_tsv(extracted)
     if not tsv.strip():
         return ""
-    tsv_path.parent.mkdir(parents=True, exist_ok=True)
-    tsv_path.write_text(tsv, encoding="utf-8")
+    try:
+        tsv_path.parent.mkdir(parents=True, exist_ok=True)
+        tsv_path.write_text(tsv, encoding="utf-8")
+    except OSError:
+        # Typically a Windows path-length limit; the Markdown table is still emitted.
+        return ""
     return str(tsv_path)

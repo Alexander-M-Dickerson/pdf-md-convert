@@ -3,17 +3,20 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import fitz
 from pdf_md_convert.layout import get_document, expired
-from pdf_md_convert.math_geometry import encode_math, balanced, reconstruct
+from pdf_md_convert.math_geometry import encode_math, balanced, is_prose_line, reconstruct
 
 
-TAG_PATTERN = r"(?:[A-Z]\.?\d+|[1-9]\d{0,3})(?:[a-z])?"
+# Four-digit numbers are years or journal page numbers, not equation tags.
+TAG_PATTERN = r"(?:[A-Z]\.?\d+|[1-9]\d{0,2})(?:[a-z])?"
 TAG_RE = re.compile(rf"\(?({TAG_PATTERN})\)?")
-STANDALONE_TAG_RE = re.compile(rf"^\s*[.;,]?\s*\(?({TAG_PATTERN})\)?\s*$")
+STANDALONE_TAG_RE = re.compile(rf"^\s*[.;,]?\s*\(({TAG_PATTERN})\)\s*[.;,]?\s*$")
+BARE_TAG_RE = re.compile(rf"^\s*[.;,]?\s*({TAG_PATTERN})\s*[.;,]?\s*$")
 INLINE_TAG_RE = re.compile(rf"\(({TAG_PATTERN})\)\s*[.;,]?\s*$")
 LEGACY_STANDALONE_TAG_RE = re.compile(
     r"^\s*[.;,]?\s*[\u0111\u00f0\u0110\u00d0]\s*([1-9]\d?|1[0-4]\d|150)\s*[\u0162\u00de\u0163\u00fe]\s*[.;,]?\s*$"
@@ -65,8 +68,16 @@ def union_rect(rects: list[fitz.Rect], page_rect: fitz.Rect, pad: float = 4.0) -
     return rect
 
 
-def tag_from_text(text: str) -> str | None:
-    for line in reversed(text.splitlines()):
+def tag_from_text(text: str, *, allow_lone_bare: bool = False) -> str | None:
+    """Return a display-equation tag, or None.
+
+    An unparenthesized number is usually a page number, section number or table
+    cell. It counts only as the final line after display math in the same block,
+    or, with ``allow_lone_bare``, as a lone block the caller has aligned beside an
+    equation.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    for position, line in enumerate(reversed(lines)):
         leading = re.match(rf"^\s*\(({TAG_PATTERN})\)\s+(.+)", line)
         if leading and (MATH_RE.search(leading[2]) or re.match(r"[A-Za-z]\s*\([^)]{1,20}\)", leading[2])):
             return leading[1]
@@ -75,6 +86,10 @@ def tag_from_text(text: str) -> str | None:
             if URL_RE.search(text) and math_signal(URL_RE.sub("", text)) < 2:
                 continue
             return match.group(1)
+        if position == 0 and (bare := BARE_TAG_RE.fullmatch(line)):
+            body = URL_RE.sub("", "\n".join(lines[:-1]))
+            if (body.strip() and math_signal(body) >= 2) or (not body.strip() and allow_lone_bare):
+                return bare.group(1)
         if MATH_RE.search(line) and not URL_RE.search(line) and (
             match := INLINE_TAG_RE.search(line.strip())
         ):
@@ -91,7 +106,8 @@ def math_signal(text: str) -> int:
     score += 2 * normalized.count("\u2192")
     score += 2 * normalized.count("\u221e")
     score += len(re.findall(r"[\u03b1-\u03c9\u0391-\u03a9]", normalized))
-    score += len(re.findall(r"[\U0001d400-\U0001d7ff]", normalized))
+    # NFKC folds math alphanumerics to plain letters, so count them in the source.
+    score += len(re.findall(r"[\U0001d400-\U0001d7ff]", text))
     score += len(re.findall(r"\b(E|Pr|ln|log|exp|Cost|Log|Inv)\b", normalized))
     return score
 
@@ -105,6 +121,22 @@ def is_math_block(text: str) -> bool:
     if URL_RE.search(stripped) and math_signal(URL_RE.sub("", stripped)) < 2:
         return False
     return bool(MATH_RE.search(stripped) and math_signal(stripped) >= 2)
+
+
+def is_prose_block(text: str) -> bool:
+    # Unicode math italics give prose with inline symbols a math signal; the
+    # number of ordinary words still separates paragraphs from displays.
+    return len(re.findall(r"\b[A-Za-z]{3,}\b", text)) >= 10
+
+
+def is_tagged_relation(text: str, tag: str) -> bool:
+    """A self-contained display such as ``m(a) < m(b). (2)``: its own tag line and a relation."""
+    if is_prose_block(text) or PROSE_SENTENCE_RE.search(text):
+        return False
+    if not re.search(rf"^\s*\({re.escape(tag)}\)\s*[.;,]?\s*$", text, re.M):
+        return False
+    body = " ".join(equation_body_lines(text, tag))
+    return bool(re.search(r"\S\s*[=<>≤≥≈∝≡]\s*\S", body))
 
 
 def same_equation_band(a: fitz.Rect, b: fitz.Rect) -> bool:
@@ -124,7 +156,11 @@ def find_equation_groups(page: fitz.Page) -> list[tuple[str, fitz.Rect, str]]:
         if idx in used:
             continue
         text = block_text(block)
-        if not is_math_block(text):
+        if not is_math_block(text) or is_prose_block(text):
+            continue
+        # An untagged lead-in sentence ("We write the gain as") must not swallow
+        # the tagged display that follows it.
+        if PROSE_SENTENCE_RE.search(text) and not tag_from_text(text):
             continue
 
         rects = [block_bbox(block)]
@@ -134,12 +170,17 @@ def find_equation_groups(page: fitz.Page) -> list[tuple[str, fitz.Rect, str]]:
         for j in range(idx + 1, min(len(blocks), idx + 4)):
             other_text = block_text(blocks[j])
             other_rect = block_bbox(blocks[j])
-            if same_equation_band(rects[0], other_rect) or (not tag and tag_from_text(other_text)):
-                if is_math_block(other_text) or tag_from_text(other_text) or len(other_text.strip()) < 80:
+            # A separate tag block sits in the equation's band, right of its centre.
+            beside = same_equation_band(rects[0], other_rect) and other_rect.x0 > (rects[0].x0 + rects[0].x1) / 2
+            other_tag = tag_from_text(other_text, allow_lone_bare=beside)
+            if is_prose_block(other_text):
+                continue
+            if same_equation_band(rects[0], other_rect) or (not tag and other_tag):
+                if is_math_block(other_text) or other_tag or len(other_text.strip()) < 80:
                     rects.append(other_rect)
                     texts.append(other_text)
                     used.add(j)
-                    tag = tag or tag_from_text(other_text)
+                    tag = tag or other_tag
 
         if tag and tag not in seen_tags:
             combined = "\n".join(texts)
@@ -164,13 +205,15 @@ def find_equation_groups(page: fitz.Page) -> list[tuple[str, fitz.Rect, str]]:
             other_rect = block_bbox(blocks[j])
             vertical_gap = max(other_rect.y0 - tag_rect.y1, tag_rect.y0 - other_rect.y1, 0)
             horizontally_near = other_rect.x0 < page.rect.x1 * 0.88
+            if is_prose_block(other_text):
+                continue
             if vertical_gap <= 95 and horizontally_near and (is_math_block(other_text) or math_signal(other_text) >= 2):
                 rects.append(other_rect)
                 texts.append(other_text)
         combined = "\n".join(texts)
         if URL_RE.search(combined) and math_signal(URL_RE.sub("", combined)) < 2:
             continue
-        if len(rects) >= 2 and math_signal(combined) >= 2:
+        if (len(rects) >= 2 and math_signal(combined) >= 2) or (len(rects) == 1 and is_tagged_relation(text, tag)):
             seen_tags.add(tag)
             groups.append((tag, union_rect(rects, page.rect), combined))
 
@@ -180,7 +223,9 @@ def find_equation_groups(page: fitz.Page) -> list[tuple[str, fitz.Rect, str]]:
     for i,block in enumerate(blocks):
         text = block_text(block); rect = block_bbox(block)
         if len(text.strip()) < 5 or len(text) > 200 or not is_math_block(text): continue
-        if PROSE_SENTENCE_RE.search(text) or any((rect & other).get_area() > .2*rect.get_area() for other in occupied): continue
+        # Without a tag, one "=" is weak evidence; function words make it prose.
+        if PROSE_SENTENCE_RE.search(text) or is_prose_line(text): continue
+        if any((rect & other).get_area() > .2*rect.get_area() for other in occupied): continue
         if text.count("=") == 1 and not re.search(r"[A-Za-z]{15,}|https?", text):
             groups.append((f"unnumbered-{i+1}", union_rect([rect], page.rect), text))
     return groups
@@ -234,7 +279,10 @@ def false_positive_reasons(raw_text: str, tag: str) -> list[str]:
         reasons.append("url-or-footer-text")
     if PROSE_SENTENCE_RE.search(body) and body.count("=") <= 1 and len(body) > 90:
         reasons.append("prose-inline-equation")
-    if len(body_lines) >= 6 and body.count("=") <= 1:
+    # Stacked fractions and sums also span many lines with one relation; a tag
+    # on its own line marks them as displays, which stay as review crops.
+    display_tag = re.search(rf"^\s*[.;,]?\s*\({re.escape(tag)}\)\s*[.;,]?\s*$", raw_text, re.M)
+    if len(body_lines) >= 6 and body.count("=") <= 1 and not display_tag:
         reasons.append("fragmented-inline-equation")
     return reasons
 
@@ -304,10 +352,17 @@ def candidate_latex(raw_text: str, tag: str) -> tuple[str | None, str, list[str]
     return f"$$\n{latex}\n\\tag{{{tag}}}\n$$", confidence, reasons
 
 
-def render_crop(page: fitz.Page, rect: fitz.Rect, crop_path: Path, dpi: int = 220) -> None:
-    crop_path.parent.mkdir(parents=True, exist_ok=True)
-    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
-    pix.save(crop_path)
+def render_crop(page: fitz.Page, rect: fitz.Rect, crop_path: Path, dpi: int = 220) -> bool:
+    """Write a crop image; a failed write (e.g. a Windows path-length limit) is not fatal."""
+    try:
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
+        pix.save(crop_path)
+        return crop_path.is_file()
+    except Exception:
+        with suppress(OSError):
+            crop_path.unlink(missing_ok=True)
+        return False
 
 
 def artifact_stem(pdf: Path) -> str:
@@ -325,48 +380,52 @@ def repair_equation_regions(
 ) -> list[EquationRegion]:
     started = time.perf_counter()
     doc = get_document(pdf)
-    regions: list[EquationRegion] = []
     crop_root = output_dir / "_equation_crops" / artifact_stem(pdf)
 
+    candidates = []
     for page_number in pages:
-        if len(regions) >= max_crops or time.perf_counter() - started > time_budget or expired(deadline):
+        if time.perf_counter() - started > time_budget or expired(deadline):
             break
-        if page_number < 1 or page_number > len(doc):
-            continue
+        if 1 <= page_number <= len(doc):
+            candidates.extend((page_number, *group) for group in find_equation_groups(doc[page_number - 1]))
+    # Numbered displays can be cited, so they claim the crop budget before
+    # unnumbered fragments; output keeps the page traversal order.
+    order = sorted(range(len(candidates)), key=lambda i: candidates[i][1].startswith("unnumbered-"))
+    taken: list[tuple[int, EquationRegion]] = []
+    for index in order:
+        page_number, tag, rect, raw_text = candidates[index]
+        if len(taken) >= max_crops or time.perf_counter() - started > time_budget or expired(deadline):
+            break
         page = doc[page_number - 1]
-        for tag, rect, raw_text in find_equation_groups(page):
-            if len(regions) >= max_crops or time.perf_counter() - started > time_budget or expired(deadline):
-                break
-            latex, confidence, reasons = candidate_latex(raw_text, tag)
-            if confidence == "discard":
-                continue
-            geometric, geometry_reasons = reconstruct(page, rect, tag)
-            if geometric:
-                suffix = "" if tag.startswith("unnumbered-") else f"\n\\tag{{{tag}}}"
-                latex = f"$$\n{geometric}{suffix}\n$$"
-                confidence = "high"
-                reasons = geometry_reasons
-            elif confidence == "high":
-                # Text-only recognizers are locators, not semantic proof.
-                latex = None
-                confidence = "low"
-                reasons = [*reasons, *geometry_reasons]
-            crop_path = crop_root / f"p{page_number:03d}_eq{tag}.png"
-            render_crop(page, rect, crop_path)
-            regions.append(
-                EquationRegion(
-                    page=page_number,
-                    tag=tag,
-                    bbox=[round(v, 2) for v in rect],
-                    raw_text=raw_text,
-                    crop_path=str(crop_path),
-                    latex=latex,
-                    confidence=confidence,
-                    reasons=reasons,
-                    quality_flags=reasons if confidence != "high" else [],
-                )
-            )
-    return regions
+        latex, confidence, reasons = candidate_latex(raw_text, tag)
+        if confidence == "discard":
+            continue
+        geometric, geometry_reasons = reconstruct(page, rect, tag)
+        if geometric:
+            suffix = "" if tag.startswith("unnumbered-") else f"\n\\tag{{{tag}}}"
+            latex = f"$$\n{geometric}{suffix}\n$$"
+            confidence = "high"
+            reasons = geometry_reasons
+        elif confidence == "high":
+            # Text-only recognizers are locators, not semantic proof.
+            latex = None
+            confidence = "low"
+            reasons = [*reasons, *geometry_reasons]
+        crop_path = crop_root / f"p{page_number:03d}_eq{tag}.png"
+        if not render_crop(page, rect, crop_path):
+            reasons = [*reasons, "crop-write-failed"]
+        taken.append((index, EquationRegion(
+            page=page_number,
+            tag=tag,
+            bbox=[round(v, 2) for v in rect],
+            raw_text=raw_text,
+            crop_path=str(crop_path),
+            latex=latex,
+            confidence=confidence,
+            reasons=reasons,
+            quality_flags=reasons if confidence != "high" else [],
+        )))
+    return [region for _, region in sorted(taken, key=lambda item: item[0])]
 
 
 def infer_referenced_equation_contexts(
@@ -435,7 +494,8 @@ def infer_referenced_equation_contexts(
             reasons.append("weak-equation-context")
         reasons.extend(["referenced-equation-context-crop", "low-confidence-no-ocr"])
         crop_path = crop_root / f"p{page_number:03d}_eq{tag}_context.png"
-        render_crop(doc[page_number - 1], rect, crop_path)
+        if not render_crop(doc[page_number - 1], rect, crop_path):
+            reasons.append("crop-write-failed")
         contexts.append(
             EquationRegion(
                 page=page_number,
@@ -467,7 +527,8 @@ def equation_context_flags(
         rf"\b(?:Eq\.?|Equation|equation)\s*\(?\s*{re.escape(tag)}\s*\)?"
     )
     has_tag_text = bool(tag_pattern.search(text))
-    has_display_tag = tag_from_text(text) == tag
+    # The text cites this tag, so a lone bare number is admissible evidence here.
+    has_display_tag = tag_from_text(text, allow_lone_bare=True) == tag
     has_reference = bool(reference_pattern.search(text))
     return has_tag_text, has_display_tag, has_reference
 

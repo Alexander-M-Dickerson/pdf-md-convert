@@ -5,7 +5,9 @@ import hashlib
 import json
 import re
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Iterable
 
@@ -34,6 +36,11 @@ MATH_GLYPHS = "αβγδεηθκλμρσφχψωΓΔΘΛΞΠΣΦΨΩ∑∫∞≤�
 MOJIBAKE_GLYPHS = "\ufffd\ufb01\ufb02âÃÂï¿½"
 EQUATION_NUMBER_RE = re.compile(r"^\s*\(?\d{1,3}\)?\s*$")
 TABLE_RE = re.compile(r"\b(Table|Panel|Dependent variable|Standard errors|Observations|Coefficient)\b", re.IGNORECASE)
+UNREADABLE_GLYPH_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Word endings that never stand alone as the second half of a compound.
+BOUND_SUFFIXES = frozenset("""ing ings tion tions sion sions ment ments ness ity ities ance ances ence ences
+    ous ive ively able ible ally ly ed ize izes ized ization ary ory ism ist ists ful""".split())
+DAMAGED_PAGE_MIN_GLYPHS = 3
 
 
 @dataclass(frozen=True)
@@ -83,7 +90,19 @@ def fix_text_artifacts(text: str) -> str:
     return text
 
 
-def normalize_fast_markdown(text: str) -> str:
+def hyphenation_vocabulary(texts: Iterable[str]) -> Counter:
+    """Count words and hyphenated compounds printed whole on one line.
+
+    Halves of a word broken at a line end are counted separately, so they never
+    vouch for the joined spelling.
+    """
+    counts = Counter()
+    for text in texts:
+        counts.update(token.casefold() for token in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)*", text))
+    return counts
+
+
+def normalize_fast_markdown(text: str, vocabulary: Counter | None = None) -> str:
     text = fix_text_artifacts(text)
     replacements = {
         "\ufb01": "fi",
@@ -92,9 +111,20 @@ def normalize_fast_markdown(text: str) -> str:
     }
     for src, dst in replacements.items():
         text = text.replace(src, dst)
+    # Fonts without a usable Unicode map yield control codes. Show the reader
+    # that a glyph is unreadable instead of passing invisible characters on.
+    text = UNREADABLE_GLYPH_RE.sub("�", text)
     # A printed hyphen can be lexical (risk-adjusted). Preserve it unless the
-    # PDF explicitly marks it as a discretionary soft hyphen.
-    text = re.sub(r"([A-Za-z])-\n([a-z])", r"\1-\2", text)
+    # PDF marks it as a soft hyphen, the document itself prints the joined word
+    # more often than the compound, or the second half is a bound suffix.
+    def join(match: re.Match) -> str:
+        left, right = match.group(1), match.group(2)
+        if vocabulary is not None:
+            joined, compound = vocabulary[(left + right).casefold()], vocabulary[f"{left}-{right}".casefold()]
+            if joined > compound or (right in BOUND_SUFFIXES and not compound):
+                return left + right
+        return f"{left}-{right}"
+    text = re.sub(r"([A-Za-z]+)-\n([a-z]+)", join, text)
     return text.rstrip() + "\n"
 
 
@@ -198,6 +228,12 @@ def merge_repair_appendix(markdown: str, repairs: list[tuple[int, str]]) -> str:
 
 TABLE_REF_RE = re.compile(
     r"\bTable\s+((?:IA\.?\s*)?(?:[A-H]\.\d+|\d+[A-Za-z]|I{1,3}|IV|V|VI{0,3}|IX|X|XI{0,3}|XIV|XV|XVI{0,3}|XIX|XX|\d+|[A-Z]+\s*\d+|[A-Z]+\d+))\b",
+    re.IGNORECASE,
+)
+SEPARATE_APPENDIX_RE = re.compile(
+    r"\b(?:Internet|Online|Supplementary|Supplemental)\s+Appendix\b"
+    r"|\bAppendix\s+[A-Z]?\.?\s*Supplementary\s+(?:data|material)"
+    r"|\bSupplementary\s+(?:data|material)\s+(?:to|for|related\s+to|associated\s+with)\s+this\s+article",
     re.IGNORECASE,
 )
 EQUATION_REF_RE = re.compile(
@@ -365,12 +401,15 @@ def build_conversion_qa(markdown: str, table_regions: list, equation_regions: li
     missing_table_refs_all = sorted(
         ref for ref in table_refs if not (table_number_aliases(ref) & extracted_table_aliases)
     )
-    missing_internet_appendix_tables = sorted(
-        ref for ref in missing_table_refs_all if ref.startswith("IA") or ref in internet_appendix_table_refs
-    )
-    missing_pdf_tables = sorted(
-        ref for ref in missing_table_refs_all if not ref.startswith("IA") and ref not in internet_appendix_table_refs
-    )
+    # When the paper says its appendix is published separately, appendix-lettered
+    # tables with no caption anywhere in this PDF are external references.
+    caption_aliases = {alias for number in caption_numbers for alias in table_number_aliases(number)}
+    external_appendix = bool(SEPARATE_APPENDIX_RE.search(markdown))
+    def is_external(ref: str) -> bool:
+        return (ref.startswith("IA") or ref in internet_appendix_table_refs or (
+            external_appendix and re.fullmatch(r"[A-H]\d+", ref) and not table_number_aliases(ref) & caption_aliases))
+    missing_internet_appendix_tables = sorted(ref for ref in missing_table_refs_all if is_external(ref))
+    missing_pdf_tables = sorted(ref for ref in missing_table_refs_all if not is_external(ref))
     equation_refs = referenced_equations(markdown)
     detected_equations = sorted({region.tag for region in equation_regions}, key=natural_ref_key)
     repaired_equations = sorted(
@@ -399,7 +438,22 @@ def build_conversion_qa(markdown: str, table_regions: list, equation_regions: li
             key=natural_ref_key,
         ),
         "suspicious_pipe_rows": suspicious_pipe_rows(markdown),
+        "damaged_text_pages": damaged_text_pages(markdown),
+        "missing_crop_images": sorted(
+            Path(crop).name
+            for region in [*equation_regions, *table_regions]
+            if (crop := getattr(region, "crop_path", "")) and not Path(crop).is_file()
+        ),
     }
+
+
+def damaged_text_pages(markdown: str) -> list[int]:
+    """Pages whose text layer has unreadable glyphs; the source image is authoritative there."""
+    pages = []
+    for match in re.finditer(r"\*\(Page (\d+)\)\*(.*?)(?=\*\(Page \d+\)\*|\Z)", markdown, re.S):
+        if match.group(2).count("�") >= DAMAGED_PAGE_MIN_GLYPHS:
+            pages.append(int(match.group(1)))
+    return pages
 
 
 def write_report(
@@ -501,8 +555,12 @@ def convert_one_hybrid(
     markdown, resolved_fast_backend = fast_markdown(pdf, backend=fast_backend)
     raw_markdown = markdown
     source_mapping = []
+    normalize = normalize_fast_markdown
     if fast_backend == "pymupdf":
-        markdown, source_mapping = layout_markdown(get_document(pdf), normalize_fast_markdown)
+        document = get_document(pdf)
+        normalize = partial(normalize_fast_markdown,
+                            vocabulary=hyphenation_vocabulary(page.get_text("text") for page in document))
+        markdown, source_mapping = layout_markdown(document, normalize)
     fast_seconds = time.perf_counter() - fast_start
 
     page_count, risks = detect_residuals(pdf)
@@ -618,7 +676,7 @@ def convert_one_hybrid(
     (audit_dir / "raw.md").write_text(raw_markdown, encoding="utf-8")
     (audit_dir / "repair_candidates.md").write_text(equation_appendix + "\n" + table_appendix, encoding="utf-8")
     if repair_placement == "inline" and source_mapping:
-        repaired_markdown, placement_events = assemble_inline(source_mapping, equation_regions, table_regions, normalize_fast_markdown)
+        repaired_markdown, placement_events = assemble_inline(source_mapping, equation_regions, table_regions, normalize)
         repaired_markdown += f"\n[Conversion audit and unresolved repair candidates](<_audit/{pdf.stem}/repair_candidates.md>)\n"
     (audit_dir / "source_map.json").write_text(json.dumps(source_mapping, ensure_ascii=False), encoding="utf-8")
     qa["suspicious_pipe_rows"] = suspicious_pipe_rows(repaired_markdown)

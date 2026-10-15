@@ -123,6 +123,28 @@ def _contained(root: Path, relative: str) -> Path:
     return path
 
 
+WINDOWS_MAX_FILE_PATH = 259  # MAX_PATH less the terminating NUL
+WINDOWS_MAX_DIR_PATH = 247   # CreateDirectory leaves room for an 8.3 file name
+
+
+def _windows_path_problem(artifact_root: Path, pdf: Path, target: Path) -> str | None:
+    """Explain why the deepest generated path would exceed the Windows limit, if it would."""
+    from .equation_regions import artifact_stem
+    stem = artifact_stem(pdf)
+    # Longest generated names: context crops, inferred table crops, audit and report files.
+    files = [Path('_equation_crops', stem, 'p000_equnnumbered-000_context.png'),
+             Path('_table_crops', stem, 'p000_table_IA.XXXIII_inferred.png'),
+             Path('_audit', pdf.stem, 'repair_candidates.md'),
+             Path(f'{pdf.stem}_conversion_report.md')]
+    longest_file = max([len(str(artifact_root / f)) for f in files] + [len(str(target)) + 4])
+    longest_dir = max(len(str(artifact_root / f.parent)) for f in files)
+    if longest_file <= WINDOWS_MAX_FILE_PATH and longest_dir <= WINDOWS_MAX_DIR_PATH:
+        return None
+    return (f'Output path too long for Windows: converting {pdf.name} would create paths of '
+            f'{longest_file} characters (limit {WINDOWS_MAX_FILE_PATH}). '
+            'Use a shorter --output-dir, such as C:\\pdf-out.')
+
+
 def _hard_qa(qa: dict) -> bool:
     return bool(qa.get('missing_referenced_tables') or qa.get('missing_referenced_equation_crops'))
 
@@ -199,6 +221,9 @@ def convert_batch(input_path: str | Path, *, output_dir: str | Path | None = Non
         else:
             valid = False
         ident = re.sub(r'[^A-Za-z0-9._-]', '_', pdf.stem)[:32] + '-' + hashlib.sha256(rel.as_posix().encode()).hexdigest()[:12]
+        # Attempt directories are 12 hex characters; check before converting anything.
+        if os.name == 'nt' and (problem := _windows_path_problem(output/'_artifacts'/ident/('0'*12), pdf, target)):
+            raise ValueError(problem)
         prepared.append((pdf, rel, target, h, old if valid else None, ident))
     output.mkdir(parents=True, exist_ok=True)
     results = []; started = time.perf_counter()
@@ -218,6 +243,8 @@ def convert_batch(input_path: str | Path, *, output_dir: str | Path | None = Non
                 ('missing_high_confidence_equation_repairs', 'Equation reconstruction review queue'),
                 ('missing_internet_appendix_tables', 'External appendix table references'),
                 ('low_text_pages', 'Low-text pages requiring inspection'),
+                ('damaged_text_pages', 'Pages with unreadable font glyphs (shown as �; use the source image)'),
+                ('missing_crop_images', 'Crop images not written (try a shorter output path)'),
             ]:
                 if r.qa.get(key):
                     lines.append(f"  - {label}: {', '.join(map(str, r.qa[key]))}")

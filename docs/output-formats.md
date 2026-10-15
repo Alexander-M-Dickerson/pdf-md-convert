@@ -22,6 +22,8 @@ Manifest output paths and structured residual artifact paths are relative to the
 
 The primary Markdown and all managed sidecars are hashed for resume validation. Do not edit manifest hashes to bypass a conflict. Old artifact attempts are retained on overwrite and are not the current output inventory. Deleting old attempts is an explicit maintenance task, not an automatic batch side effect.
 
+QA fields in the manifest and summaries include missing referenced tables and equation crops (hard findings), external appendix references, the equation reconstruction queue, low-text pages, `damaged_text_pages` (pages whose font encoding produced unreadable glyphs, shown as `�` in the Markdown; use the source image there) and `missing_crop_images` (evidence images that could not be written). Appendix-lettered tables are reported as external rather than missing only when the paper says its appendix is published separately and no caption for them appears in the PDF.
+
 `needs_review` does not distinguish a correct passage from an incorrect one: it means automated extraction has not established whole-document accuracy. A reviewed subset must identify its scope. Raw text, region detection, crop capture, reconstruction confidence, and visual verification are different forms of evidence.
 
 Legacy `hybrid` outputs keep their existing report conventions; the new batch manifest applies to `batch` only.
