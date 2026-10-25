@@ -87,6 +87,72 @@ def expired(deadline: float | None) -> bool:
     return deadline is not None and time.perf_counter() >= deadline
 
 
+# A gap wider than this share of the font size between two printed characters is a word space. Glued word gaps sit
+# at 0.13 to 0.15; some fonts leave up to 0.12 after an "f" inside a word, and real word spaces start near 0.17.
+SPACE_GAP_SHARE = .13
+_GLUE_RUN = re.compile(r"[A-Za-z]{15,}")  # shorter runs cost far more reads than they repair
+# Spacing accents are separate glyphs placed over a letter ("P´astor"); their gaps say nothing about words.
+_ACCENTS = set("¨´`ˆ˜ˇ˘˙˚˝¯¸˛") | {chr(c) for c in range(0x300, 0x370)}
+_NO_SPACE_BEFORE = set(".,;:!?)]}%'’”-‐‑") | _ACCENTS
+_NO_SPACE_AFTER = set("([{‘“-‐‑") | _ACCENTS
+_MATH_FONT = re.compile(r"(?i)math|^(MT|RMT)(MI|SY|EX)|^CM(MI|SY|EX)|^MSAM|^MSBM|symbol|greek|euclid")
+
+
+def _font(span: dict) -> str:
+    return span["font"].split("+")[-1]
+
+
+def _block_text(block: dict, gap_share: float | None) -> str:
+    """A rawdict text block as get_text("blocks") writes it, optionally with spaces at wide gaps."""
+    lines = []
+    for line in block["lines"]:
+        if gap_share is None or abs(line["dir"][1]) >= .01:
+            lines.append("".join(c["c"] for span in line["spans"] for c in span["chars"])); continue
+        out, prev = [], None
+        for span in line["spans"]:
+            size, math = span["size"], bool(_MATH_FONT.search(_font(span)))
+            for c in span["chars"]:
+                if (prev is not None and not math and not prev[2]
+                        and not c["c"].isspace() and not prev[0]["c"].isspace()
+                        and c["c"] not in _NO_SPACE_BEFORE and prev[0]["c"] not in _NO_SPACE_AFTER
+                        and abs(c["origin"][1] - prev[0]["origin"][1]) <= .2 * prev[1]
+                        and c["bbox"][0] - prev[0]["bbox"][2] > gap_share * prev[1]):
+                    out.append(" ")
+                out.append(c["c"]); prev = (c, size, math)
+        lines.append("".join(out))
+    return "\n".join(lines) + "\n"
+
+
+def restore_missing_spaces(page, blocks: list[tuple], vocabulary: Counter, gap_share: float | None = None) -> list[tuple]:
+    """Put back word spaces that PyMuPDF drops when the printed gap is narrow.
+
+    MuPDF inserts a space only above roughly 0.15 of the font size, and tightly set
+    lines in some journals print their word gaps just below that, so whole lines come
+    out as one token. Only blocks holding a long letter run found nowhere else in the
+    document are rebuilt from character positions; real long words repeat. A block
+    keeps its original text unless the rebuild, before adding spaces, reproduces it.
+    Character positions are read for the one suspect block alone (a clipped read is
+    cheaper) or, with several suspects, once for the whole page.
+    """
+    suspects = [i for i,b in enumerate(blocks)
+                if any(vocabulary[run.casefold()] <= 1 for run in _GLUE_RUN.findall(b[4]))]
+    if not suspects: return blocks
+    if len(suspects) == 1:
+        clip = fitz.Rect(blocks[suspects[0]][:4])
+        raw = page.get_text("rawdict", flags=fitz.TEXTFLAGS_BLOCKS, clip=clip)["blocks"]
+        rebuilt = {suspects[0]: {"lines": [line for b in raw if b["type"] == 0 for line in b["lines"]]}}
+    else:
+        raw = {tuple(round(v, 2) for v in b["bbox"]): b
+               for b in page.get_text("rawdict", flags=fitz.TEXTFLAGS_BLOCKS)["blocks"] if b["type"] == 0}
+        rebuilt = {i: raw.get(tuple(round(v, 2) for v in blocks[i][:4])) for i in suspects}
+    out = list(blocks)
+    for i, block in rebuilt.items():
+        if block is None or _block_text(block, None) != blocks[i][4]: continue
+        spaced = _block_text(block, gap_share or SPACE_GAP_SHARE)
+        if spaced != blocks[i][4]: out[i] = (*blocks[i][:4], spaced, *blocks[i][5:])
+    return out
+
+
 def ordered_blocks(page) -> list[tuple]:
     blocks = [b for b in page.get_text("blocks") if len(b) < 7 or b[6] == 0]
     mid = page.rect.width / 2
@@ -175,20 +241,39 @@ def margin_blocks(doc) -> set[tuple[int, tuple]]:
     return excluded
 
 
+def merge_broken_words(texts: list[str]) -> list[str]:
+    """Join a block that ends in ``word-`` to the next block when it continues in lowercase.
+
+    Blocks are normalized one at a time, so a word broken across two blocks
+    (many PDFs store every line as its own block) would keep its hyphen and
+    split the paragraph. The merged text keeps the line break for the
+    hyphenation rule to judge.
+    """
+    merged = []
+    for text in texts:
+        if merged and re.search(r"[A-Za-z]-\s*$", merged[-1]) and re.match(r"\s*[a-z]", text):
+            merged[-1] = merged[-1].rstrip() + "\n" + text.lstrip()
+        else:
+            merged.append(text)
+    return merged
+
+
 def layout_markdown(doc, normalize) -> tuple[str, list[dict]]:
     margins = margin_blocks(doc); pages = []; mapping = []
+    vocabulary = Counter(run.casefold() for page in doc for b in page.get_text("blocks") if len(b) < 7 or b[6] == 0
+                         for run in re.findall(r"[A-Za-z]+", b[4]))
     for number,page in enumerate(doc, 1):
         parts = []; records = []; seen = set()
-        for i,b in enumerate(ordered_blocks(page)):
+        for i,b in enumerate(restore_missing_spaces(page, ordered_blocks(page), vocabulary)):
             margin = (number - 1, tuple(b[:4])) in margins
             # Some PDFs draw the same text twice at one position (e.g. for bolding).
             duplicate = not margin and (tuple(b[:4]), b[4]) in seen
             seen.add((tuple(b[:4]), b[4]))
             records.append({"id": f"p{number}-b{i}", "bbox": list(b[:4]), "text": b[4],
                             "excluded_margin": margin, "excluded_duplicate": duplicate})
-            if not margin and not duplicate: parts.append(normalize(b[4]).strip())
+            if not margin and not duplicate: parts.append(b[4])
         mapping.append({"page": number, "blocks": records})
-        pages.append(f"*(Page {number})*\n\n" + "\n\n".join(parts))
+        pages.append(f"*(Page {number})*\n\n" + "\n\n".join(normalize(text).strip() for text in merge_broken_words(parts)))
     return "\n\n".join(pages).rstrip() + "\n", mapping
 
 
@@ -236,10 +321,14 @@ def assemble_inline(mapping: list[dict], equations, tables, normalize) -> tuple[
             edits[start] = f"<!-- source-region: p{number}-{kind}-{key} -->\n{replacement}"
             consumed.update(selected)
             event.update(status="reconstructed", source_blocks=[blocks[i]["id"] for i in selected])
-        output = []
+        output = []; run = []
+        # Broken words are rejoined only between blocks kept as text, never across a replaced region.
         for i,block in enumerate(blocks):
-            if i in edits: output.append(edits[i])
-            elif i not in consumed and not block["excluded_margin"] and not block.get("excluded_duplicate"):
-                output.append(normalize(block["text"]).strip())
+            if i in consumed:
+                output += [normalize(text).strip() for text in merge_broken_words(run)]; run = []
+                if i in edits: output.append(edits[i])
+            elif not block["excluded_margin"] and not block.get("excluded_duplicate"):
+                run.append(block["text"])
+        output += [normalize(text).strip() for text in merge_broken_words(run)]
         pages.append(f"*(Page {number})*\n\n" + "\n\n".join(output))
     return "\n\n".join(pages).rstrip() + "\n", events

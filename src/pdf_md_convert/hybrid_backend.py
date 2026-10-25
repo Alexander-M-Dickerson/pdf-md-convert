@@ -93,13 +93,47 @@ def fix_text_artifacts(text: str) -> str:
 def hyphenation_vocabulary(texts: Iterable[str]) -> Counter:
     """Count words and hyphenated compounds printed whole on one line.
 
-    Halves of a word broken at a line end are counted separately, so they never
-    vouch for the joined spelling.
+    Halves of a word broken at a line end are left out, so they never vouch
+    for either spelling. Keys ``long-`` and ``-run`` count the printed
+    compounds that a word starts or ends.
     """
     counts = Counter()
     for text in texts:
-        counts.update(token.casefold() for token in re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)*", text))
+        lines = [line.strip() for line in text.splitlines()]
+        for i,line in enumerate(lines):
+            tokens = re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)*", line)
+            if line.endswith("-"): tokens = tokens[:-1]
+            if i and lines[i - 1].endswith("-"): tokens = tokens[1:]
+            for token in tokens:
+                token = token.casefold(); counts[token] += 1
+                if "-" in token:
+                    parts = token.split("-"); counts[parts[0] + "-"] += 1; counts["-" + parts[-1]] += 1
     return counts
+
+
+# Below this many vocabulary entries a document is too short for a word's
+# absence to mean anything.
+FRAGMENT_EVIDENCE_MIN_ENTRIES = 500
+
+
+def rejoin_line_break(left: str, right: str, vocabulary: Counter) -> bool:
+    """Whether ``left-`` at a line end and ``right`` on the next line are one word.
+
+    The document's own spelling decides first; a capitalized second half
+    (Fama-French, post-IPO) needs that evidence to join. Then bound suffixes.
+    A paper prints most words it uses more than once, so in a long document a
+    half never printed on its own is a fragment (eco-nomics). It still keeps
+    its hyphen when the other half is printed and either half forms printed
+    compounds (long-run, risk-adjusted).
+    """
+    joined, compound = vocabulary[(left + right).casefold()], vocabulary[f"{left}-{right}".casefold()]
+    if joined != compound or not right[0].islower(): return joined > compound
+    if right in BOUND_SUFFIXES and not compound: return True
+    if len(vocabulary) < FRAGMENT_EVIDENCE_MIN_ENTRIES: return False
+    left, right = left.casefold(), right.casefold()
+    if vocabulary[left] and vocabulary[right]: return False
+    if not vocabulary[left] and not vocabulary[right]: return True
+    return not (vocabulary[left + "-"] or vocabulary["-" + right])
 
 
 def normalize_fast_markdown(text: str, vocabulary: Counter | None = None) -> str:
@@ -115,16 +149,15 @@ def normalize_fast_markdown(text: str, vocabulary: Counter | None = None) -> str
     # that a glyph is unreadable instead of passing invisible characters on.
     text = UNREADABLE_GLYPH_RE.sub("�", text)
     # A printed hyphen can be lexical (risk-adjusted). Preserve it unless the
-    # PDF marks it as a soft hyphen, the document itself prints the joined word
-    # more often than the compound, or the second half is a bound suffix.
+    # PDF marks it as a soft hyphen or the document's evidence says the two
+    # halves are one word (rejoin_line_break). Either way the line break goes,
+    # so a compound before a capital no longer reads "Fama- French".
     def join(match: re.Match) -> str:
         left, right = match.group(1), match.group(2)
-        if vocabulary is not None:
-            joined, compound = vocabulary[(left + right).casefold()], vocabulary[f"{left}-{right}".casefold()]
-            if joined > compound or (right in BOUND_SUFFIXES and not compound):
-                return left + right
+        if vocabulary is not None and rejoin_line_break(left, right, vocabulary):
+            return left + right
         return f"{left}-{right}"
-    text = re.sub(r"([A-Za-z]+)-\n([a-z]+)", join, text)
+    text = re.sub(r"([A-Za-z]+)-\n([A-Za-z]+)", join, text)
     return text.rstrip() + "\n"
 
 
