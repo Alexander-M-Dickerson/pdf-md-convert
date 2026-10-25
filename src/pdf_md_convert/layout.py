@@ -241,6 +241,23 @@ def margin_blocks(doc) -> set[tuple[int, tuple]]:
     return excluded
 
 
+def merge_broken_words(texts: list[str]) -> list[str]:
+    """Join a block that ends in ``word-`` to the next block when it continues in lowercase.
+
+    Blocks are normalized one at a time, so a word broken across two blocks
+    (many PDFs store every line as its own block) would keep its hyphen and
+    split the paragraph. The merged text keeps the line break for the
+    hyphenation rule to judge.
+    """
+    merged = []
+    for text in texts:
+        if merged and re.search(r"[A-Za-z]-\s*$", merged[-1]) and re.match(r"\s*[a-z]", text):
+            merged[-1] = merged[-1].rstrip() + "\n" + text.lstrip()
+        else:
+            merged.append(text)
+    return merged
+
+
 def layout_markdown(doc, normalize) -> tuple[str, list[dict]]:
     margins = margin_blocks(doc); pages = []; mapping = []
     vocabulary = Counter(run.casefold() for page in doc for b in page.get_text("blocks") if len(b) < 7 or b[6] == 0
@@ -254,9 +271,9 @@ def layout_markdown(doc, normalize) -> tuple[str, list[dict]]:
             seen.add((tuple(b[:4]), b[4]))
             records.append({"id": f"p{number}-b{i}", "bbox": list(b[:4]), "text": b[4],
                             "excluded_margin": margin, "excluded_duplicate": duplicate})
-            if not margin and not duplicate: parts.append(normalize(b[4]).strip())
+            if not margin and not duplicate: parts.append(b[4])
         mapping.append({"page": number, "blocks": records})
-        pages.append(f"*(Page {number})*\n\n" + "\n\n".join(parts))
+        pages.append(f"*(Page {number})*\n\n" + "\n\n".join(normalize(text).strip() for text in merge_broken_words(parts)))
     return "\n\n".join(pages).rstrip() + "\n", mapping
 
 
@@ -304,10 +321,14 @@ def assemble_inline(mapping: list[dict], equations, tables, normalize) -> tuple[
             edits[start] = f"<!-- source-region: p{number}-{kind}-{key} -->\n{replacement}"
             consumed.update(selected)
             event.update(status="reconstructed", source_blocks=[blocks[i]["id"] for i in selected])
-        output = []
+        output = []; run = []
+        # Broken words are rejoined only between blocks kept as text, never across a replaced region.
         for i,block in enumerate(blocks):
-            if i in edits: output.append(edits[i])
-            elif i not in consumed and not block["excluded_margin"] and not block.get("excluded_duplicate"):
-                output.append(normalize(block["text"]).strip())
+            if i in consumed:
+                output += [normalize(text).strip() for text in merge_broken_words(run)]; run = []
+                if i in edits: output.append(edits[i])
+            elif not block["excluded_margin"] and not block.get("excluded_duplicate"):
+                run.append(block["text"])
+        output += [normalize(text).strip() for text in merge_broken_words(run)]
         pages.append(f"*(Page {number})*\n\n" + "\n\n".join(output))
     return "\n\n".join(pages).rstrip() + "\n", events
