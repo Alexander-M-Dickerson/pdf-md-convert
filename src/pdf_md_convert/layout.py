@@ -106,17 +106,19 @@ def _block_text(block: dict, gap_share: float | None) -> str:
     """A rawdict text block as get_text("blocks") writes it, optionally with spaces at wide gaps."""
     lines = []
     for line in block["lines"]:
-        chars = [(c, span["size"], _font(span)) for span in line["spans"] for c in span["chars"]]
+        if gap_share is None or abs(line["dir"][1]) >= .01:
+            lines.append("".join(c["c"] for span in line["spans"] for c in span["chars"])); continue
         out, prev = [], None
-        for c, size, font in chars:
-            if (gap_share is not None and prev is not None and abs(line["dir"][1]) < .01
-                    and not c["c"].isspace() and not prev[0]["c"].isspace()
-                    and c["c"] not in _NO_SPACE_BEFORE and prev[0]["c"] not in _NO_SPACE_AFTER
-                    and not _MATH_FONT.search(font) and not _MATH_FONT.search(prev[2])
-                    and abs(c["origin"][1] - prev[0]["origin"][1]) <= .2 * prev[1]
-                    and c["bbox"][0] - prev[0]["bbox"][2] > gap_share * prev[1]):
-                out.append(" ")
-            out.append(c["c"]); prev = (c, size, font)
+        for span in line["spans"]:
+            size, math = span["size"], bool(_MATH_FONT.search(_font(span)))
+            for c in span["chars"]:
+                if (prev is not None and not math and not prev[2]
+                        and not c["c"].isspace() and not prev[0]["c"].isspace()
+                        and c["c"] not in _NO_SPACE_BEFORE and prev[0]["c"] not in _NO_SPACE_AFTER
+                        and abs(c["origin"][1] - prev[0]["origin"][1]) <= .2 * prev[1]
+                        and c["bbox"][0] - prev[0]["bbox"][2] > gap_share * prev[1]):
+                    out.append(" ")
+                out.append(c["c"]); prev = (c, size, math)
         lines.append("".join(out))
     return "\n".join(lines) + "\n"
 
